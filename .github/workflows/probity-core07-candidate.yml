@@ -21,6 +21,13 @@ jobs:
           ref: ${{ github.sha }}
           path: candidate
           persist-credentials: false
+      - name: Check out the agreed frozen suite
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: hjs-spec/jep-core
+          ref: a87a395b54b5685fd22d6cc86d120058f1c8850d
+          path: agreed
+          persist-credentials: false
       - name: Check out the separately maintained reader
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -31,129 +38,54 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.13.15'
-      - name: Record the executed sources before installing dependencies
+      - name: Retain source heads before installing dependencies
         env:
-          EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          EVENT_REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-        shell: bash
         run: |
-          set -euo pipefail
           mkdir candidate-core07-result
           python - <<'PY'
-          import hashlib
           import json
           import os
           from pathlib import Path
           import subprocess
-          import tomllib
 
-          def git(directory, expression):
+          def revision(root, expression):
               return subprocess.check_output(
-                  ['git', '-C', directory, 'rev-parse', expression], text=True
+                  ['git', '-C', root, 'rev-parse', expression], text=True
               ).strip()
 
-          candidate = git('candidate', 'HEAD')
-          reader = git('reader', 'HEAD')
-          assert candidate == os.environ['EVENT_SHA'], 'candidate checkout differs from event SHA'
-          assert reader == 'cbd3ea8f4de89b835d6d3c4182ff4b4b1c7608f9', 'reader pin differs'
-          paths = (
-              'pyproject.toml', 'reference-validator/byoi.py',
-              'reference-validator/byoi_reference_adapter.py',
-              'reference-validator/jep_validate_07.py',
-              'reference-validator/byoi_suite/manifest.json',
-          )
           identity = {
-              'candidate_sha': candidate,
-              'candidate_tree': git('candidate', 'HEAD^{tree}'),
-              'reader_sha': reader,
-              'reader_tree': git('reader', 'HEAD^{tree}'),
-              'event': {name: os.environ[name] for name in (
-                  'EVENT_NAME', 'EVENT_SHA', 'PR_HEAD_SHA', 'EVENT_REPOSITORY',
-                  'RUN_ID', 'RUN_ATTEMPT',
-              )},
-              'candidate_files_sha256': {
-                  name: hashlib.sha256((Path('candidate') / name).read_bytes()).hexdigest()
-                  for name in paths
+              'sources': {
+                  root: {'head': revision(root, 'HEAD'), 'tree': revision(root, 'HEAD^{tree}')}
+                  for root in ('candidate', 'agreed', 'reader')
               },
+              'event': {key: os.environ.get(key) for key in (
+                  'EVENT_SHA', 'PR_HEAD_SHA', 'GITHUB_REPOSITORY',
+                  'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_ACTOR',
+              )},
           }
-          project = tomllib.loads(Path('candidate/pyproject.toml').read_text())['project']
-          implementation = {
-              'name': 'jep-core-candidate-reference-adapter',
-              'version': project['version'],
-              'source': 'https://github.com/' + os.environ['EVENT_REPOSITORY'],
-              'revision': candidate,
-              'independence': 'reference-wrapper; not an independent implementation',
-              'reused_components': ['candidate JEP validator, signing helpers and BYOI runner'],
-          }
-          output = Path('candidate-core07-result')
-          (output / 'sources.json').write_text(json.dumps(identity, indent=2) + '\n')
-          (output / 'implementation.json').write_text(json.dumps(implementation, indent=2) + '\n')
+          Path('candidate-core07-result/checkouts.json').write_text(
+              json.dumps(identity, indent=2) + '\n'
+          )
           PY
-      - name: Install the candidate and pinned reader dependencies
+      - name: Install candidate and pinned reader dependencies
         run: |
           python -m pip install -e './candidate[test]'
           python -m pip install -r reader/interop/jep-core07-reader/requirements.txt
-      - name: Test the candidate JEP validator and producer
-        shell: bash
+      - name: Run candidate checks, the pinned reader and fault controls
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          set +e
-          python -m jep_conformance.byoi run \
-            --suite candidate/reference-validator/byoi_suite \
-            --implementation candidate-core07-result/implementation.json \
-            --adapter '["python", "-m", "jep_conformance.byoi_reference_adapter"]' \
-            --role verifier --role producer \
-            --report candidate-core07-result/native-report.json \
-            > candidate-core07-result/native.log 2>&1
-          status=$?
-          printf '%s\n' "$status" > candidate-core07-result/native-exit-status.txt
-          cat candidate-core07-result/native.log
-          exit "$status"
-      - name: Run the pinned separate reader on candidate-owned suite bytes
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p candidate-core07-result
-          set +e
-          python reader/interop/jep-core07-reader/run.py \
-            --upstream candidate/reference-validator/byoi_suite \
-            --output candidate-core07-reader-result \
-            --reader-revision cbd3ea8f4de89b835d6d3c4182ff4b4b1c7608f9 \
-            > candidate-core07-result/reader.log 2>&1
-          status=$?
-          printf '%s\n' "$status" > candidate-core07-result/reader-exit-status.txt
-          cat candidate-core07-result/reader.log
-          exit "$status"
-      - name: Check the distinct result populations
-        shell: bash
-        run: |
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          native = json.loads(Path('candidate-core07-result/native-report.json').read_text())
-          assert native['outcome'] == 'pass'
-          assert native['requested_roles'] == ['producer', 'verifier']
-          assert (native['tests_passed'], native['tests_failed'], native['tests_unsupported'],
-                  native['tests_not_selected']) == (29, 0, 0, 8)
-          reader = json.loads(Path('candidate-core07-reader-result/report.json').read_text())
-          assert reader['reader_revision'] == 'cbd3ea8f4de89b835d6d3c4182ff4b4b1c7608f9'
-          assert reader['summary'] == {
-              'validation': {'total': 25, 'passed': 25},
-              'producer': {'total': 4, 'passed': 4},
-              'acceptance': {'total': 8, 'passed': 8},
-          }
-          PY
-      - name: Retain source identities, both reports, logs and synthetic reader state
+          python candidate/scripts/check_probity_core07_candidate.py \
+            --candidate candidate --agreed agreed --reader reader \
+            --output candidate-core07-result/runs
+      - name: Retain both suite identities, reports, source mutations and logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: probity-core07-candidate-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            candidate-core07-result
-            candidate-core07-reader-result
+          path: candidate-core07-result
           if-no-files-found: error
           retention-days: 90
